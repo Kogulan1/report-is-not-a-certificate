@@ -1,0 +1,342 @@
+\documentclass[11pt,a4paper]{article}
+
+% Fonts: Unicode-aware text so that ligatures (fi, fl) survive copy/paste and search.
+\usepackage{iftex}
+\ifXeTeX
+  \usepackage{fontspec} % defaults to Latin Modern (OpenType), Unicode text layer
+\else
+  \usepackage{cmap}
+  \usepackage[T1]{fontenc}
+  \usepackage[utf8]{inputenc}
+  \usepackage{lmodern}
+\fi
+\usepackage[margin=1in]{geometry}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage[hidelinks]{hyperref}
+\usepackage[capitalise,noabbrev]{cleveref}
+
+\newcolumntype{L}{>{\raggedright\arraybackslash}X}
+\setlength{\parskip}{0.35em}
+
+\hypersetup{
+  pdftitle={The report is not a certificate: metric integrity and residual failures of a Gaussian-copula synthesizer for flat clinical tables},
+  pdfauthor={Kogulan Natarajan},
+  pdfsubject={Synthetic clinical data, privacy evaluation},
+  pdfkeywords={synthetic data, Gaussian copula, t-closeness, membership inference, clinical tables, evaluation}
+}
+
+\title{The report is not a certificate:\\[0.3em]
+\large Metric integrity and residual failures of a Gaussian-copula synthesizer for flat clinical tables}
+\author{Kogulan Natarajan\\[0.2em]
+\normalsize Gesalp AI (\href{https://gesalpai.ch}{gesalpai.ch}), Winterthur, Switzerland\\
+\normalsize \href{mailto:Kogulan1@gmail.com}{Kogulan1@gmail.com}}
+\date{October 2026}
+
+\begin{document}
+\maketitle
+
+\begin{center}
+\begin{minipage}{0.9\textwidth}
+\small\centering
+Prepared for the ETH AI Center Doctoral Fellowship 2027 (proposed mentors: Prof.\ Gunnar Rätsch and Prof.\ Florian Tramèr, ETH Zurich).\\
+\emph{Unpublished manuscript, not peer-reviewed.}
+\end{minipage}
+\end{center}
+
+\begin{abstract}
+\noindent
+Synthetic data is often proposed as a way to share clinical tables without moving patient records. The evidence that accompanies a synthetic table is usually a quality report, and that report is only as trustworthy as the code that computes it. This manuscript studies the evaluation contract of Gesalp AI, a service that turns one de-identified flat clinical CSV into a synthetic table drawn from a Gaussian copula, together with a report of nine gated checks. Each check is PASS, WARN, FAIL, or N/A, and a check that could not be computed stays N/A. Three findings are reported. \emph{Metric integrity:} until revision v2-35 (6 September 2026), a correlation check that crashed was stored as 0.0 and displayed as a perfect pass; we describe the defect and the rule that replaced it. \emph{Calibration:} the pass bar for mean Kolmogorov--Smirnov (KS) distance (at most 0.10) is supported by a real-versus-real null at $n \ge 200$, and the pass bar for privacy gain (at least 0.87) is the fifth percentile of a 960-draw null in which the synthetic table is replaced by a disjoint real sample; the $t$-closeness failure line stays at 0.28. \emph{Residual failures:} on a recorded 26-table gate (v2-46, 18 September 2026), 22 of 26 tables had no failing check, 12 of 26 had every measured check at PASS, and 26 of 26 passed KS. Wisconsin, Heart VA, and thyroid fail $t$-closeness at 0.324, 0.300, and 0.350 while their marginals and downstream classifier utility hold; we argue that on these tables the quasi-identifiers nearly determine the label. Mammographic masses fails duplicate rate, linkage, and outlier shielding. A completed run is not a GDPR or HIPAA determination, does not make a table anonymous, and carries no differential-privacy guarantee. We close with a research agenda for privacy-preserving clinical machine learning: paired $t$-closeness, holdout membership inference, and differentially private generation evaluated under the same checks.
+\end{abstract}
+
+\section{Introduction}\label{sec:intro}
+
+Clinical tables are shared so that someone who does not hold the source records can still fit a model, rehearse a study, or test a pipeline. Removing names and identifiers is not enough to protect the patients behind the rows: combinations of age, sex, laboratory values, and diagnosis can single out a person, and a model trained on the data can reveal whether a given record was used~\cite{shokri2017,stadler2022}. Synthetic data is offered as a way out: fit a model to the source table, sample a new table from it, and release only the sample~\cite{jordon2022}. The idea is attractive and easy to over-claim. A generator can reproduce every marginal of a table while keeping exactly the associations an attacker would exploit~\cite{stadler2022}, and a dashboard can show a perfect score for a metric that raised an exception and was silently replaced by zero.
+
+This manuscript describes the evaluation contract of Gesalp AI and the measurements that contract has produced. The system accepts one rectangular, de-identified CSV and returns a synthetic CSV and an evaluation report with nine gated checks. The claim is deliberately narrow: the report separates a measured number from a missing one; the pass bars we highlight were either set from a null distribution or kept after a null argued against moving them; and a recorded 26-table gate has a specific, named set of residual failures. We do not claim that a finished run certifies compliance, that the synthetic table is anonymous, or that every table clears every check.
+
+Two scope decisions follow. First, identifiable patient data is out of scope: the service is specified for tables that have already been de-identified and is not offered as a processor of protected health information. Second, differential privacy (DP) is out of scope: the report states no $(\varepsilon,\delta)$ guarantee, and this paper does not retrofit one.
+
+The generator under study is a Gaussian copula~\cite{sklar1959,patki2016}. Neural generators such as CTGAN, TVAE~\cite{xu2019}, and tabular diffusion models~\cite{kotelnikov2023} are not on the production path evaluated here.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+  \item \textbf{An evaluation contract with an explicit ``not measured'' state.} Every check has four possible statuses, and N/A is never collapsed into PASS or FAIL. We document a real defect, a crashed correlation metric reported as a perfect score, that motivated this rule (\cref{sec:status}).
+  \item \textbf{Null-calibrated pass bars and admission floors.} We show how real-versus-real nulls fixed the KS pass bar at 0.10 for $n \ge 200$ and moved the privacy-gain pass bar from 1.00 to 0.87, and why tables below 200 rows are labelled indicative and tables below 40 rows are refused (\cref{sec:checks,sec:admission}).
+  \item \textbf{A complete report of one 26-table gate, failures included.} We give the zero-FAIL, all-green, and KS counts and name every failing table and check (\cref{sec:eval}).
+  \item \textbf{An analysis of $t$-closeness failures when quasi-identifiers are near-labels.} Three failing tables pass KS and downstream utility yet fail $t$-closeness; we explain this through the structure of the tables and a change in sampling multiplicity (\cref{sec:discussion}).
+  \item \textbf{A research agenda} for privacy-preserving clinical machine learning that follows from these measurements (\cref{sec:agenda}).
+\end{enumerate}
+
+\section{Background and related work}\label{sec:related}
+
+\paragraph{Copula models for tabular data.}
+Sklar's theorem states that any multivariate distribution function can be decomposed into its univariate marginals and a copula that carries the dependence between them~\cite{sklar1959}. A Gaussian copula models that dependence as the correlation matrix of normal scores obtained by transforming each marginal. Patki, Wedge, and Veeramachaneni used this construction as the per-table building block of the Synthetic Data Vault (SDV), a system for synthesising relational databases~\cite{patki2016}. We work with a single flat table and propose no new copula estimator.
+
+\paragraph{Neural tabular generators.}
+CTGAN and TVAE, introduced together by Xu et al., model mixed-type tables with a conditional GAN and a variational autoencoder respectively~\cite{xu2019}. TabDDPM applies denoising diffusion to mixed numerical and categorical features~\cite{kotelnikov2023}. Synthcity collects many such generators behind a common plugin interface for benchmarking~\cite{qian2023}. These methods are the usual points of comparison; none of them produced the numbers reported here.
+
+\paragraph{Privacy models for released tables.}
+Formal privacy notions for released tables predate synthetic data. $k$-anonymity requires every combination of quasi-identifier values to be shared by at least $k$ records~\cite{sweeney2002}. $\ell$-diversity additionally requires each such equivalence class to contain at least $\ell$ ``well-represented'' values of the sensitive attribute~\cite{machanavajjhala2007}. $t$-closeness requires the distribution of the sensitive attribute inside each class to lie within distance $t$ of its distribution in the whole table; Li, Li, and Venkatasubramanian measure that distance with the Earth Mover's Distance~\cite{li2007}. Our $t$-closeness check belongs to this line of work but is a different, simpler statistic: a mean total-variation distance computed on the synthetic table, with continuous quasi-identifiers binned by quantile (\cref{sec:checks}). It is a review threshold, not a proof that the table satisfies $t$-closeness in the formal sense.
+
+\paragraph{Attacks on models and synthetic data.}
+In a membership inference attack, an adversary tries to tell from a model's outputs whether a specific record was part of its training data; Shokri et al.\ introduced the shadow-model version of this attack~\cite{shokri2017}. Stadler, Oprisanu, and Troncoso evaluated synthetic data publishing against linkage and attribute-inference attacks across several generators. They found no generator that both resisted the attacks and kept utility, and they found the resulting privacy gain hard to predict before release~\cite{stadler2022}. Jordon et al.\ likewise stress that synthetic data is not private by default and that any guarantee comes from the generation mechanism rather than the output table~\cite{jordon2022}. Ganev and De Cristofaro further show that the similarity-based privacy metrics common in commercial synthetic-data products can pass while membership, attribute-inference, and reconstruction attacks succeed~\cite{ganev2025}. These results are why our report prints measured attack scores and why we do not treat a completed run as anonymisation. The membership score we compute is weaker than the holdout attacks in this literature; \cref{sec:agenda} describes what a stronger study would require.
+
+\paragraph{Differential privacy.}
+Differential privacy bounds how much the presence or absence of a single record can change the distribution of a mechanism's output~\cite{dwork2006}. It is the right tool when such a bound is required. It is not a property of the system described here.
+
+\paragraph{Clinical data standards.}
+The OMOP Common Data Model, maintained by the OHDSI community, is a widely used standard schema for observational health data~\cite{hripcsak2015}. On upload, the system suggests OMOP concepts for column names when its vocabulary match is confident. It does not produce a full CDM instance, and mapping accuracy is not one of the nine scored checks.
+
+\section{System and evaluation contract}\label{sec:method}
+
+\subsection{What a run is}
+
+A run consumes one flat CSV with a header row and consistent columns: a single de-identified table, not a relational extract or a set of linked files. The user may request up to ten times as many synthetic rows as input rows. The report states how many rows were requested and how many were delivered, and any shortfall is printed rather than hidden. The deliverable is the synthetic table plus the report. The seals on the report (\cref{sec:seals}) refer only to the checks that ran; none of them means ``compliant'' or ``anonymous''.
+
+\subsection{Pipeline}\label{sec:pipeline}
+
+A worker runs five levels in order, wrapped by the search loop of \cref{sec:search}.
+
+\begin{description}
+  \item[L1, cleaning.] Column types are inferred, missing values are imputed, and a structural quality check runs before any model is fitted. The tokens \texttt{none} and \texttt{nil} are kept as genuine categories; \texttt{?}, \texttt{na}, and \texttt{unknown} are treated as missing. Label casing is preserved, so a diagnosis code is not case-folded into a different level. Datetime columns remain datetimes and are written back in their original format.
+  \item[L2, profiling.] The table is profiled (column types, cardinalities, and a target column when one is evident), and a blueprint records the model family and its settings. On the path studied here the family is the Gaussian copula. The blueprint is a configuration artefact, not a second dataset.
+  \item[L3, sampling.] The copula is fitted and a synthetic table is sampled. Privacy post-processing may then run: a small jitter that breaks exact copies of training rows, a limited categorical swap, a rejection step for rows that lie too close to the training table, and a correction of marginals. We call this layer the post-sampling overlay. We do not claim that every step fired on every table in the reported gate; \cref{sec:eval} notes where the project's diagnosis attributes an effect to five-times sampling combined with this overlay.
+  \item[L4, audit.] Utility and privacy checks are computed. A check that cannot be computed is stored as an absent value with a recorded reason. Non-finite values are treated as absent (\cref{sec:status}).
+  \item[L5, report.] Scores, reasons, and artefacts are written. An absent metric is serialised as absent, never as a default number. A missing bookkeeping record for the run does not by itself turn a completed evaluation into a failure.
+\end{description}
+
+Column names are matched to OMOP concepts when the vocabulary agrees; otherwise the column is flagged for review~\cite{hripcsak2015}. This mapping is an annotation, not an OMOP export, and not a scored check.
+
+\subsection{The generator under study}\label{sec:generator}
+
+A Gaussian-copula synthesizer estimates a marginal distribution for each column, transforms each column to a standard normal score through its marginal, estimates the correlation matrix of those scores, samples from the corresponding multivariate normal, and maps the samples back through the inverse marginals~\cite{sklar1959,patki2016}. Discrete columns are encoded so that the copula receives numeric input. The post-sampling overlay of \cref{sec:pipeline} is applied afterwards.
+
+Neural generators (conditional GANs, TVAE, and tabular diffusion models~\cite{xu2019,kotelnikov2023}) were evaluated in the wider codebase but were never deployed to production and did not produce the v2-46 gate. One property of the copula matters later: it has no training-epoch control, so a search step that requests ``more epochs'' does not change the fit (\cref{sec:results}).
+
+\subsection{Search loop}\label{sec:search}
+
+An iterative search loop refits and rescores up to seven times. The retained attempt is the best under a lexicographic key: fewest FAIL checks, then a privacy-aware tie-break, then fewest WARN checks, then the smallest total relative distance to the PASS bars. An unmeasured check contributes nothing to that distance; it is neither a deficit nor a pass.
+
+The policy has two phases and contains no branch on dataset name. Phase~1 targets failures of membership-inference AUC, exact-duplicate rate, linkage-attack success, and outlier shielding. Phase~2 tries to recover utility (KS distance, correlation delta, AUROC retention, privacy gain, and $t$-closeness) without switching generator. $t$-closeness is scored and can trigger another attempt, but it does not block phase~1. The loop aims for zero FAIL checks; WARN is allowed at exit.
+
+In the reported gate, retry proposals were generated by a hosted large-language-model service. A later revision (v2-47) adds a stop when a proposed retry would not change the copula; that stop is not part of the v2-46 numbers.
+
+\subsection{Status values and the correlation defect}\label{sec:status}
+
+Each gated check evaluates to one of four statuses. PASS and WARN are bands on a measured value; FAIL lies outside the WARN band. The fourth status (SKIP internally, N/A in the report) means that the check was not computed or that its value was missing, NaN, or infinite. N/A is not PASS, WARN, or FAIL. A measured zero is a real zero. Replacing an absent value with zero, or a zero with a fallback, inverts the meaning of the report.
+
+This rule exists because it was once broken. Until revision v2-35 (6 September 2026), the correlation check called the SDMetrics \texttt{CorrelationSimilarity} metric with a metadata object where the metric expects a plain dictionary. The call raised an exception on every run of the main pipeline, and the exception handler stored \texttt{corr\_delta = 0.0}. Because the gate treats correlation delta as lower-is-better with PASS at or below 0.10, every such run displayed a perfect correlation score. A separate evaluation path that computed correlations directly in NumPy was not affected. The fix passes the metadata as a dictionary, stores the value as absent if the metric still fails, and records the reason. A table with fewer than two non-constant numeric columns also yields an absent result rather than a delta of zero.
+
+Non-finite values cause the same class of error if they reach the comparisons: NaN compares false against every threshold, so it becomes FAIL, and it is not valid JSON, so it can abort the whole score write. The normaliser that runs before gating therefore maps \texttt{None}, NaN, and infinities to absent.
+
+\subsection{Checks and thresholds}\label{sec:checks}
+
+\Cref{tab:checks} is the single threshold table used by the auditor, the search loop, and the report. PASS is the inner bar, WARN the outer bar, and anything beyond WARN is FAIL. The bars are review aids. They do not guarantee that a table will meet them, and they are not a certificate.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Gated checks and thresholds. ``Lower'' means smaller values are better.}
+\label{tab:checks}
+\begin{tabularx}{\textwidth}{@{}l L c c c@{}}
+\toprule
+Check & What is computed & PASS & WARN & Better \\
+\midrule
+\texttt{ks\_mean} & Mean two-sample KS distance across columns~\cite{massey1951} & $\le 0.10$ & $\le 0.15$ & lower \\
+\texttt{corr\_delta} & One minus aggregate pairwise correlation similarity & $\le 0.10$ & $\le 0.15$ & lower \\
+\texttt{mia\_auc} & ROC-AUC of an in-pipeline distance attack (\cref{sec:agenda}) & $\le 0.55$ & $\le 0.60$ & lower \\
+\texttt{dup\_rate} & Fraction of synthetic rows identical to a training row & $\le 0.03$ & $\le 0.05$ & lower \\
+\texttt{linkage\_attack\_success} & Success rate of a record-linkage attack & $\le 0.03$ & $\le 0.05$ & lower \\
+\texttt{auroc\_retention} & Synthetic-trained over real-trained classifier AUC, capped at 1 & $\ge 0.85$ & $\ge 0.80$ & higher \\
+\texttt{privacy\_gain} & Mean nearest-neighbour distance to a reference part of the real table: synthetic rows over a second real part (neither part is held out from the generator) & $\ge 0.87$ & $\ge 0.76$ & higher \\
+\texttt{outlier\_shielding} & Fraction of local-outlier rows whose nearest synthetic neighbour is farther than the median & $\ge 0.90$ & $\ge 0.80$ & higher \\
+\texttt{t\_closeness} & Mean total-variation distance of the sensitive attribute within quasi-identifier classes & $\le 0.20$ & $\le 0.28$ & lower \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{Utility checks.}
+\texttt{ks\_mean} is one minus the SDMetrics KS-complement score, that is, a mean KS distance~\cite{massey1951}. \texttt{corr\_delta} is one minus correlation similarity. Both are lower-is-better and share the 0.10 / 0.15 bars.
+
+\texttt{auroc\_retention} is a train-on-synthetic, test-on-real ratio. A random forest is fitted once on the synthetic table and once on an 80\% real split; both are scored on the same 20\% real holdout, and the ratio is capped at 1. If the real-data baseline AUC is below 0.55, or the synthetic-trained AUC is undefined, the implementation substitutes an indistinguishability score under the same name. These two quantities are not the same estimand, so a value near 1 means ``the downstream classifier held up'' only when the ratio was used. The three $t$-closeness failures in \cref{sec:results} are recorded with AUROC retention 1.0, consistent with the capped ratio.
+
+\paragraph{Privacy checks.}
+\texttt{privacy\_gain} is a ratio of mean nearest-neighbour distances. The numerator is the distance from each synthetic row to its nearest row in a reference part of the real table; the denominator is the same distance from a second, disjoint part of the real table to that reference part. Because the generator is fitted on the whole cleaned table, neither real part is held out from the generator. A ratio near 1 means synthetic rows are about as far from the reference rows as other real rows are. It is a distance heuristic, not differential-privacy accounting. Ganev and De Cristofaro show that similarity-based metrics of this family (distance to closest record and related tests) can pass while membership and reconstruction attacks still succeed~\cite{ganev2025}; we therefore treat privacy gain as one screening signal among the nine, never as evidence of anonymity.
+
+\texttt{t\_closeness} follows the idea of Li et al.~\cite{li2007} but scores a simpler reduction. Equivalence classes are formed on up to three quasi-identifier columns, with high-cardinality numeric quasi-identifiers binned by quantile. For a low-cardinality sensitive attribute, the per-class distance is the total variation between the class distribution and the table-wide distribution, and the gated value is the mean over classes with at least five rows. If no demographic quasi-identifier is detected, the implementation falls back to the leading numeric columns instead of reporting a vacuous zero. The distance is computed on the synthetic table only, so on its own it cannot say whether the real table already had the same concentration.
+
+\paragraph{Three fixed bars.}
+Three bars are fixed, and this paper does not propose moving them.
+
+\emph{KS, PASS at or below 0.10.} A real-versus-real study compared disjoint halves of the same clinical tables, which is the distribution a perfect generator would match. Pooled across sizes, about 79\% of those half-pairs clear 0.10, a figure pulled down by tables under 200 rows. At $n \ge 200$, every table's median real-versus-real KS distance was at or below 0.10. The bar is therefore reachable by a faithful generator at the certified sample size, and remaining KS warnings are a generator problem. The bar stays.
+
+\emph{Privacy gain, PASS at or above 0.87.} The natural centre of the ratio is 1, which was the previous pass bar, and it is the wrong pass bar. We replaced the synthetic table with a disjoint real third (a real sample exchangeable with the comparison slice; no generator is fitted in the null) and obtained 960 measurements (32 tables $\times$ 30 splits). These 32 tables are a separate benchmark set from the 26-table gate cohort of \cref{sec:eval}. The median was 1.006 and the mean 1.010, so the estimator is centred. The 1st, 5th, and 10th percentiles were 0.761, 0.866, and 0.899. A pass bar at 1.00 accepted only 53.1\% of these ideal draws; a bar at 0.87 accepted 94.2\%. The failure line sits at the 1st percentile, 0.76. Splitting the null by row count does not change the conclusion: the spread comes from the geometry of the statistic, not from small samples. This corrects a bar that could not distinguish a memorising generator from a perfect one. It leaves a residual: the production median at the time of recalibration, 0.942, sat at the 20th percentile of the null, a mild shift towards the training rows. That shift is open engineering work, not a reason to lower 0.87 further.
+
+\emph{$t$-closeness, FAIL above 0.28.} PASS is at or below 0.20, WARN extends to 0.28 inclusive, and anything above 0.28 is FAIL. \Cref{sec:discussion} explains why the three tables that fail this check are not a reason to raise the line.
+
+\subsection{Admission floors}\label{sec:admission}
+
+On very small tables the checks measure sampling noise. At 20 rows, the real-versus-real KS distance is about 0.225 against a pass bar of 0.10, so even a perfect synthesizer would fail KS. At the same size, membership-inference AUC with a true value of 0.5 has been observed to range from roughly 0.32 to 0.69, producing false failures in about one run in four. Split-based distances also run out of rows.
+
+The service therefore has two floors. Below 40 rows a run is refused, because privacy and utility cannot be estimated and the noise exceeds the gates. From 40 to 199 rows a run is marked \emph{indicative}. At 200 rows or more a run is in the \emph{certified} tier, the regime in which the KS null supports the 0.10 bar. The public description of the service states a minimum of 200 rows; the indicative band exists so that a smaller file is labelled as such rather than scored as if it were certified.
+
+\subsection{Seals}\label{sec:seals}
+
+The report header carries one of three seals. CHECKS PASSED means every measured check is PASS. PARTIAL AUDIT means that distance or correlation checks were capped on a wide table, or that no check was measured. REVIEW REQUIRED means that at least one measured check is WARN or FAIL, so a finished run with an outstanding warning is REVIEW REQUIRED. N/A cannot earn CHECKS PASSED by being treated as PASS, and it does not create a failure on its own. In the results, \emph{all-green} means every measured check is PASS, and \emph{zero-FAIL} means no check is FAIL (WARN may remain).
+
+\section{Evaluation}\label{sec:eval}
+
+\subsection{Datasets and protocol}
+
+The reported result is one recorded gate of the production pipeline, not a new experiment run for this manuscript. The cohort consists of 26 flat clinical tables, predominantly public UCI-style benchmarks rather than hospital extracts. The full per-table scoreboard is not reproduced here; tables are named below only where the recorded outcome is available.
+
+The gate is revision v2-46, run on 18 September 2026 in two batches. The generator is the Gaussian copula of \cref{sec:generator}, and the search loop is the seven-attempt loop of \cref{sec:search}. A table counts as zero-FAIL when its retained attempt has no FAIL under \cref{tab:checks}, and as all-green when every measured check is PASS. An earlier gate, revision v2-38 on 6 September 2026, is reported only as context for how the failure set moved. No gate was re-executed, no threshold was changed, and no dataset was added for this manuscript.
+
+\subsection{Results}\label{sec:results}
+
+\begin{table}[t]
+\centering
+\small
+\caption{Recorded 26-table gates. Counts are of tables, not of individual checks.}
+\label{tab:gates}
+\begin{tabularx}{\textwidth}{@{}l l c c L@{}}
+\toprule
+Gate & Date & Zero-FAIL & All-green & KS PASS \\
+\midrule
+v2-38 & 6 September 2026 & 22/26 (85\%) & 8/26 (31\%) & below 26/26; \texttt{heart\_va} failed \texttt{ks\_mean} \\
+v2-46 & 18 September 2026 & 22/26 (85\%) & 12/26 (46\%) & 26/26 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The headline result (\cref{tab:gates}) is the v2-46 aggregate: \textbf{22 of 26 tables zero-FAIL, 12 of 26 all-green, and 26 of 26 KS PASS.} It is not 26 of 26 without failures. Between the two gates, all-green rose from 8 to 12 while the zero-FAIL count stayed at 22; what changed is which checks fail.
+
+On v2-38 the four failing tables were Haberman survival (linkage), Heart VA (KS mean), immunotherapy (membership-inference AUC and AUROC retention), and mammographic masses (duplicate rate, linkage, and outlier shielding). The main sources of warnings on that gate were KS mean on 10 of 26 tables, privacy gain on 6 of 26, and $t$-closeness on 4 of 26. Warning counts for v2-46 were not recorded in the sources used here, and we do not impute them.
+
+\begin{table}[t]
+\centering
+\small
+\caption{The four failing tables in gate v2-46. KS distances are from the project's diagnosis of 19 September 2026. Mammographic masses is among the 26 of 26 KS passes; its KS value and failure magnitudes were not recorded in the sources used here.}
+\label{tab:failures}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{2.4cm} >{\raggedright\arraybackslash}p{2.6cm} c c L@{}}
+\toprule
+Table & Failing checks & Value & KS dist. & Quasi-identifiers vs.\ label \\
+\midrule
+Wisconsin & $t$-closeness & 0.324 & 0.025 & \texttt{mean radius} $\times$ \texttt{mean texture} vs.\ \texttt{target}; no age or sex, numeric fallback \\
+Heart VA & $t$-closeness & 0.300 & 0.022 & age $\times$ sex vs.\ 5-class \texttt{num}; sex split 194/6 \\
+Thyroid & $t$-closeness & 0.350 & 0.042 & \texttt{T3resin} $\times$ \texttt{Thyroxin} vs.\ \texttt{class} \\
+Mammographic masses & duplicate rate, linkage, outlier shielding & n/r & PASS & not a $t$-closeness failure in this gate \\
+\bottomrule
+\end{tabularx}
+
+\smallskip
+\raggedright\footnotesize n/r: not recorded in the sources used for this manuscript.
+\end{table}
+
+The source files for these four tables have the following dimensions: Wisconsin breast cancer, 569 rows and 31 columns; Heart VA, 200 rows and 14 columns; thyroid, 215 rows and 6 columns; mammographic masses, 961 rows and 6 columns. These describe the input files, not a re-measurement of the gate.
+
+On the three $t$-closeness failures (\cref{tab:failures}), the recorded AUROC retention was 1.0. The marginals matched (KS between 0.022 and 0.042, all PASS), and a classifier trained on the synthetic table matched the real-data baseline. What did not match closely enough to clear 0.28 was the distribution of the label inside the quasi-identifier bins.
+
+A local one-times copula draw, reported in the same diagnosis but not part of the v2-46 aggregate, stayed below the failure line on all three tables: Wisconsin 0.263 (WARN), Heart VA 0.129, and thyroid 0.107. On that draw, however, thyroid's AUROC retention was 0.66, below the WARN bar of 0.80. The diagnosis attributes the gate failures to five-times sampling combined with the post-sampling overlay, which sharpened the mapping from quasi-identifier to label. Logs of the gate's thyroid run show the loop retrying $t$-closeness within a band of about 0.32 to 0.38. Because the copula has no epoch control, those retries could not change the model. A later canary on v2-47 stopped the thyroid retries after the first attempt, and $t$-closeness was still 0.350: the stop saves compute but is not a repair.
+
+The same diagnosis records cryotherapy at a $t$-closeness of 0.272, inside the WARN band, showing the same pattern without crossing the failure line. We do not count it as a failure.
+
+Mammographic masses remains a failure of exact copies, linkage, and outlier shielding, all phase-1 attack checks. Passing KS on this table, as the 26 of 26 KS result includes, does not address them. The three rates were not recorded in the sources used here, and we do not supply substitutes.
+
+\section{Discussion}\label{sec:discussion}
+
+The v2-46 gate is evidence about one copula pipeline with a fixed scoreboard, on flat, mostly public clinical tables, under the bars of \cref{tab:checks}. Within that scope, four observations stand out.
+
+\paragraph{Metric integrity matters more than the generator.}
+Before v2-35 the correlation cell was green because the metric had crashed. Any comparison of quality across that boundary is void for correlation, and it is a caution about every other cell: a status means something only if the report is able to show N/A. By contrast, the 26 of 26 KS result is a measured pass, under a bar that a real-versus-real null supports at $n \ge 200$; it does not paper over a missing value.
+
+\paragraph{Zero-FAIL and all-green answer different questions.}
+Twenty-two tables have nothing in the FAIL band, and twelve have every measured check at PASS. The ten-table gap consists of warnings, and warnings are part of the result. The CHECKS PASSED seal corresponds to the twelve, not the twenty-two. Publishing only the larger number would repeat in prose the error the correlation bug made in code.
+
+\paragraph{The residual failures are specific and of two kinds.}
+Mammographic masses fails duplicate rate, linkage, and outlier shielding: some synthetic rows are too close to real rows in the sense these attacks measure. The other three failures pass KS and the downstream classifier but fail $t$-closeness because the quasi-identifiers are almost the diagnosis. Wisconsin has no age or sex column, so the fallback bins use mean radius and mean texture, the very measurements the diagnostic label summarises. In Heart VA the sex split is 194 to 6, so an age-by-sex grid is nearly an age grid set against a five-class angiographic label. In thyroid the quasi-identifiers are the T3-resin and thyroxine assays that define the class. A faithful copula that reproduces these relationships will concentrate the label inside those bins, and the total-variation distance then exceeds 0.28 even while every marginal KS distance stays near 0.02. Raising the failure line until these tables pass would hide that structure, so the line stays at 0.28.
+
+\paragraph{Sampling multiplicity trades utility against $t$-closeness.}
+The one-times comparison rules out the simple story that ``the copula cannot satisfy $t$-closeness''. At one times, the same three tables were below the failure line, and thyroid paid for it with an AUROC retention of 0.66. The gate's five-times draw with the overlay kept utility (AUROC retention 1.0) and lost $t$-closeness. This is the kind of privacy--utility exchange Stadler et al.\ report~\cite{stadler2022}, appearing here as a change in sampling multiplicity rather than in generator family. It is also the case in which a synthetic-only $t$-closeness value is hardest to interpret, because the gate does not report the same distance on the real table. If the real bins are already this concentrated, the synthetic failure reflects fidelity; if the real bins are mixed and the synthetic bins concentrated, it reflects amplification. \Cref{sec:agenda} treats that distinction as open work, not as grounds to relabel 0.324 as a pass.
+
+The search loop does not remove this residual. Phase~2 may not switch generator, and the copula ignores epoch requests, so on v2-46 the thyroid table spent its seven-attempt budget on a score that stayed between 0.32 and 0.38. Stopping identical retries, as v2-47 does, is the right systems response, but it does not produce a better generator.
+
+\section{Limitations}\label{sec:limitations}
+
+\paragraph{Cohort.} The cohort is 26 flat, mostly public, clinical tables. It is not an electronic health record, a multi-site OMOP extract, or a sample of the tables a hospital data office would release, and a pass rate on it does not transfer to those settings. Mapping a column to an OMOP concept is not evidence about synthesis quality.
+
+\paragraph{Reproducibility.} The headline numbers belong to revision v2-46. Later revisions exist but have not been evaluated on a repeated 26-table gate, and single-table canaries after v2-46 are not a substitute. The v2-46 search was steered by a language model, so a reimplementation that follows only the written rules may not reproduce attempt-level traces even with an unchanged threshold table. The gate was not re-run for this paper. Per-table values for the 22 zero-FAIL tables, the duplicate, linkage, and outlier rates for mammographic masses, and the v2-46 warning totals are not reported because they were not available in the sources used.
+
+\paragraph{Strength of the privacy checks.} The in-pipeline membership score partitions the source table after the generator has been fitted on all of it (\cref{sec:agenda}), so it is not a holdout membership study. Privacy gain has the same in-sample limitation: both real parts it compares were seen by the generator, so its denominator is not a held-out reference. No $(\varepsilon,\delta)$ guarantee is claimed. $k$-anonymity and $\ell$-diversity are computed by the auditor but are not part of \cref{tab:checks}, and this paper does not treat them as passed. The privacy-gain and KS bars are null-calibrated; the membership bar (0.55) and the $t$-closeness bars (0.20 and 0.28) are operational thresholds without a comparable null. That is a reason to build the null, not to adjust the bars in the meantime.
+
+\paragraph{Metric naming.} \texttt{auroc\_retention} can hold an indistinguishability score when the real baseline is too weak to support the ratio, and the name in the report does not change when this happens.
+
+\paragraph{Third-party software.} Parts of the implementation path use the SDV library~\cite{patki2016}, which remains a dependency of the deployed image; its current releases are distributed under the Business Source License~1.1, and that licence restricts offering SDV's functionality as a commercial synthetic-data service. The \texttt{copulas} library is also distributed under the Business Source License~1.1. The provenance of the deployed copula engine (an SDV or \texttt{copulas} component versus in-house code) is not documented in the sources used here. This licensing question is unresolved, and this manuscript does not assert that the implementation is licence-clean. (The SDMetrics evaluators named above are distributed separately under the MIT licence.) A licence-clean reimplementation is part of the agenda in \cref{sec:agenda}.
+
+\paragraph{Author's role.} The author designed and operates the system under study. All measurements are those recorded by the project's own gates, including the failures.
+
+\section{Future work: a research agenda for privacy-preserving clinical machine learning}\label{sec:agenda}
+
+This agenda is written for the ETH AI Center Doctoral Fellowship 2027, with Prof.\ Gunnar Rätsch and Prof.\ Florian Tramèr (ETH Zurich) as proposed mentors. It sits between clinical machine learning and the security and privacy of machine learning, and it is a research proposal, not a description of an existing affiliation or supervision arrangement. Each problem below follows from the measurements above, and none of them is solved by loosening \cref{tab:checks}.
+
+\paragraph{1. $t$-closeness when the quasi-identifier is nearly the label.}
+The missing measurement is a paired distance: the same binned total variation computed on the real table and on the synthetic table, under a quasi-identifier policy fixed before fitting. If the two agree, a FAIL tells the reader that the label is largely a function of the features, a property of the clinical table that should be disclosed as such. If the synthetic distance is larger, sampling or post-processing has sharpened a relationship the source did not have, which is a synthesis defect. The Wisconsin fallback, the Heart VA sex margin (194/6), and the thyroid assays are the first three cases to instrument. A useful negative result would show that no sampling multiplicity keeps KS at or below 0.10, AUROC retention at or above 0.85, and $t$-closeness at or below 0.28 on these tables at the same time. Such a result would be reported as a frontier, not by moving 0.28.
+
+\paragraph{2. Holdout membership inference with calibrated thresholds.}
+The current \texttt{mia\_auc} splits the real rows 75/25 after synthesis, scores each row by its negative distance to the nearest synthetic row, and reports ROC-AUC, with values below 0.5 raised to 0.5; PASS is at or below 0.55. Because every real row was available when the copula was fitted, the 25\% slice is not a set of non-members. The statistic only asks whether one random quarter of the training table lies closer to the synthetic cloud than the other three quarters. A proper study would fit only on a member partition, lock a non-member partition before fitting, and pre-register both a distance attack and a shadow-model attack in the sense of Shokri et al.~\cite{shokri2017} and the synthetic-data attacks of Stadler et al.~\cite{stadler2022}. The 0.55 bar would then be placed on a null stratified by sample size, using the same percentile argument that set privacy gain at 0.87, with the existing 26 tables serving as a development set rather than the final evaluation set. Until that study exists, the membership cell is a screening signal, not a claim about membership advantage.
+
+\paragraph{3. Differentially private generation under the same checks.}
+Adding noise and writing ``private'' on the report would repeat the correlation bug: a word standing in for a measurement that was not made. A doctoral project could instead train a copula, or a stronger generator, under a stated $(\varepsilon,\delta)$-differential-privacy guarantee~\cite{dwork2006} and report utility and attack results under \cref{tab:checks} without renaming any failed check. Stadler et al.\ found that differentially private generators trade utility for protection rather than escaping the trade-off~\cite{stadler2022}. The empirical question is where a privately trained copula lies on the same checks, at a pre-registered $\varepsilon$, on tables where the quasi-identifier is and is not close to the label. The system described in this paper would serve as the non-private baseline.
+
+\paragraph{4. Beyond single flat tables.}
+Clinical data is rarely one flat table. Patient records are relational and longitudinal, and OMOP-style data spans many linked tables~\cite{hripcsak2015}. Extending the evaluation contract (explicit N/A, null-calibrated bars, size-aware admission, and paired privacy measurements) to multi-table and longitudinal synthesis is necessary before any claim about hospital-scale data can be made.
+
+\paragraph{5. A licence-clean, reproducible reference implementation.}
+A Gaussian copula needs only marginal distributions, a latent correlation, and the inverse transform~\cite{sklar1959,patki2016}, so the model does not depend on any particular library. Reimplementing the sampler and the nine checks under a permissive licence, and showing parity with the v2-46 protocol on the same 26 tables (same thresholds, admission floors, and definitions of zero-FAIL and all-green), would make the benchmark open and reproducible. Any parity gap would have to be explained, never closed by editing a bar.
+
+\section{Conclusion}\label{sec:conclusion}
+
+The contract studied here is a report that can be read by someone who does not trust the generator. Nine checks are PASS, WARN, FAIL, or N/A, and absent measurements stay absent. Before v2-35, a caught exception in the correlation check was stored as 0.0 and displayed as a perfect pass; that path is closed. The KS pass bar of 0.10 and the privacy-gain pass bar of 0.87 are tied to measured nulls, and the $t$-closeness failure line of 0.28 stays because the tables that cross it are tables on which the quasi-identifier is nearly the label.
+
+On the recorded v2-46 gate, the honest summary is 22 of 26 tables with no failing check, 12 of 26 all-green, and 26 of 26 passing KS. Wisconsin, Heart VA, and thyroid fail $t$-closeness at 0.324, 0.300, and 0.350, and mammographic masses fails duplicate rate, linkage, and outlier shielding. A finished run is not a compliance certificate and does not make a table anonymous; identifiable-patient processing and differential privacy are outside the current system. These limits are the starting point for the research agenda in \cref{sec:agenda}.
+
+\begin{thebibliography}{99}
+
+\bibitem{patki2016} N.~Patki, R.~Wedge, and K.~Veeramachaneni. The Synthetic Data Vault. In \emph{Proc.\ IEEE International Conference on Data Science and Advanced Analytics (DSAA)}, pages 399--410, 2016. doi:10.1109/DSAA.2016.49.
+
+\bibitem{xu2019} L.~Xu, M.~Skoularidou, A.~Cuesta-Infante, and K.~Veeramachaneni. Modeling tabular data using conditional GAN. In \emph{Advances in Neural Information Processing Systems 32 (NeurIPS)}, 2019.
+
+\bibitem{kotelnikov2023} A.~Kotelnikov, D.~Baranchuk, I.~Rubachev, and A.~Babenko. TabDDPM: Modelling tabular data with diffusion models. In \emph{Proc.\ 40th International Conference on Machine Learning (ICML)}, PMLR 202, pages 17564--17579, 2023.
+
+\bibitem{qian2023} Z.~Qian, B.-C.~Cebere, and M.~van der Schaar. Synthcity: facilitating innovative use cases of synthetic data in different data modalities. arXiv:2301.07573, 2023.
+
+\bibitem{shokri2017} R.~Shokri, M.~Stronati, C.~Song, and V.~Shmatikov. Membership inference attacks against machine learning models. In \emph{Proc.\ IEEE Symposium on Security and Privacy (S\&P)}, pages 3--18, 2017. doi:10.1109/SP.2017.41.
+
+\bibitem{stadler2022} T.~Stadler, B.~Oprisanu, and C.~Troncoso. Synthetic data -- anonymisation groundhog day. In \emph{Proc.\ 31st USENIX Security Symposium}, pages 1451--1468, 2022.
+
+\bibitem{jordon2022} J.~Jordon, L.~Szpruch, F.~Houssiau, M.~Bottarelli, G.~Cherubin, C.~Maple, S.~N.~Cohen, and A.~Weller. Synthetic data -- what, why and how? arXiv:2205.03257, 2022.
+
+\bibitem{ganev2025} G.~Ganev and E.~De Cristofaro. The inadequacy of similarity-based privacy metrics: privacy attacks against ``truly anonymous'' synthetic datasets. In \emph{Proc.\ IEEE Symposium on Security and Privacy (S\&P)}, 2025. arXiv:2312.05114.
+
+\bibitem{sweeney2002} L.~Sweeney. $k$-anonymity: a model for protecting privacy. \emph{International Journal of Uncertainty, Fuzziness and Knowledge-Based Systems}, 10(5):557--570, 2002.
+
+\bibitem{machanavajjhala2007} A.~Machanavajjhala, D.~Kifer, J.~Gehrke, and M.~Venkitasubramaniam. $\ell$-diversity: privacy beyond $k$-anonymity. \emph{ACM Transactions on Knowledge Discovery from Data}, 1(1), Article 3, 2007.
+
+\bibitem{li2007} N.~Li, T.~Li, and S.~Venkatasubramanian. $t$-closeness: privacy beyond $k$-anonymity and $\ell$-diversity. In \emph{Proc.\ 23rd IEEE International Conference on Data Engineering (ICDE)}, pages 106--115, 2007.
+
+\bibitem{sklar1959} A.~Sklar. Fonctions de répartition à $n$ dimensions et leurs marges. \emph{Publications de l'Institut de Statistique de l'Université de Paris}, 8:229--231, 1959.
+
+\bibitem{dwork2006} C.~Dwork, F.~McSherry, K.~Nissim, and A.~Smith. Calibrating noise to sensitivity in private data analysis. In \emph{Theory of Cryptography Conference (TCC)}, LNCS 3876, pages 265--284, 2006.
+
+\bibitem{hripcsak2015} G.~Hripcsak, J.~D.~Duke, N.~H.~Shah, C.~G.~Reich, V.~Huser, M.~J.~Schuemie, M.~A.~Suchard, R.~W.~Park, I.~C.~K.~Wong, P.~R.~Rijnbeek, J.~van der Lei, N.~Pratt, G.~N.~Norén, Y.-C.~Li, P.~E.~Stang, D.~Madigan, and P.~B.~Ryan. Observational Health Data Sciences and Informatics (OHDSI): opportunities for observational researchers. \emph{Studies in Health Technology and Informatics}, 216:574--578, 2015.
+
+\bibitem{massey1951} F.~J.~Massey. The Kolmogorov--Smirnov test for goodness of fit. \emph{Journal of the American Statistical Association}, 46(253):68--78, 1951.
+
+\end{thebibliography}
+
+\end{document}
